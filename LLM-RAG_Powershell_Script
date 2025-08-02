@@ -1,0 +1,918 @@
+#Powershell Script
+# setup.ps1
+# PowerShell script to set up local LLM chat applications for llama3 (port 5000) and phi3 (port 5001)
+
+# Step 1: Check and Install Python
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+    Write-Host "Python not found. Installing Python..."
+    Invoke-WebRequest -Uri "https://www.python.org/ftp/python/3.12.0/python-3.12.0-amd64.exe" -OutFile "python-installer.exe"
+    Start-Process -Wait -FilePath "python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1"
+    Remove-Item "python-installer.exe"
+    Write-Host "Python installed."
+} else {
+    Write-Host "Python already installed."
+}
+
+# Step 2: Install Python Dependencies
+Write-Host "Installing Python dependencies..."
+python -m pip install --upgrade pip
+pip install flask ollama chromadb sentence-transformers PyPDF2
+
+# Step 3: Check and Install Ollama
+if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
+    Write-Host "Ollama not found. Installing Ollama..."
+    Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile "OllamaSetup.exe"
+    Start-Process -Wait -FilePath "OllamaSetup.exe" -ArgumentList "/S"
+    Remove-Item "OllamaSetup.exe"
+    Write-Host "Ollama installed."
+} else {
+    Write-Host "Ollama already installed."
+}
+
+# Step 4: Pull Ollama Models
+Write-Host "Pulling Ollama models..."
+Start-Process -Wait -FilePath "ollama" -ArgumentList "pull llama3"
+Start-Process -Wait -FilePath "ollama" -ArgumentList "pull phi3"
+
+# Step 5: Create Directories
+$dirs = @("C:\MyLLM\data", "C:\MyLLM\chroma_db", "C:\MyLLM-2.0\data", "C:\MyLLM-2.0\chroma_db")
+foreach ($dir in $dirs) {
+    if (-not (Test-Path $dir)) {
+        New-Item -Path $dir -ItemType Directory
+        Write-Host "Created directory: $dir"
+    }
+}
+
+# Step 6: Create app.py for C:\MyLLM (llama3, port 5000)
+$appPyLlama3 = @"
+from flask import Flask, request, render_template_string
+import ollama
+import chromadb
+from sentence_transformers import SentenceTransformer
+import os
+import PyPDF2
+import time
+import warnings
+import json
+from datetime import datetime
+import logging
+
+# Set up logging
+logging.basicConfig(filename=r"C:\MyLLM\app.log", level=logging.DEBUG, 
+                    format='%(asctime)s %(levelname)s: %(message)s')
+
+# Suppress FutureWarning from transformers
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+app = Flask(__name__)
+client = chromadb.PersistentClient(path=r"C:\MyLLM\chroma_db")
+collection = client.get_or_create_collection("rag_collection")
+model = None
+data_folder = r"C:\MyLLM\data"
+history_file = r"C:\MyLLM\chat_history.json"
+
+# Ensure data folder exists
+if not os.path.exists(data_folder):
+    os.makedirs(data_folder)
+
+# Check if llama3 model is available
+try:
+    ollama_response = ollama.list()
+    logging.info(f"Raw Ollama list response: {ollama_response}")
+    if 'models' not in ollama_response:
+        raise ValueError("Ollama list response does not contain 'models' key. Ensure Ollama server is running.")
+    models = ollama_response['models']
+    model_names = [m.get('name', '') for m in models]
+    if not model_names:
+        raise ValueError("No models found in Ollama. Run 'ollama pull llama3' to download the model.")
+    if 'llama3:latest' not in model_names:
+        raise ValueError("Model 'llama3' not found. Run 'ollama pull llama3' to download it.")
+    logging.info("Model 'llama3' found in Ollama")
+except Exception as e:
+    logging.error(f"Failed to verify Ollama models: {str(e)}")
+    raise
+
+# Load or initialize chat history
+def load_history():
+    try:
+        if os.path.exists(history_file):
+            with open(history_file, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load chat history: {str(e)}")
+    return []
+
+def save_history(history):
+    try:
+        with open(history_file, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save chat history: {str(e)}")
+
+# Initialize history
+chat_history = load_history()
+
+# Initialize SentenceTransformer
+try:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    logging.info("SentenceTransformer loaded successfully")
+except Exception as e:
+    logging.error(f"Failed to load SentenceTransformer: {str(e)}")
+    raise
+
+def index_documents():
+    try:
+        start_time = time.time()
+        existing_ids = collection.get()['ids']
+        logging.info(f"Existing IDs in collection: {existing_ids}")
+        if existing_ids:
+            collection.delete(ids=existing_ids)
+            logging.info("Deleted existing IDs from collection")
+        files = os.listdir(data_folder)
+        logging.info(f"Files in data folder: {files}")
+        if files:
+            for filename in files:
+                filepath = os.path.join(data_folder, filename)
+                logging.info(f"Processing file: {filename}")
+                if filename.endswith('.txt'):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                    logging.info(f"Read text file: {filename}, length: {len(text)}")
+                elif filename.endswith('.pdf'):
+                    with open(filepath, 'rb') as f:
+                        pdf = PyPDF2.PdfReader(f)
+                        text = " ".join(page.extract_text() for page in pdf.pages)
+                    logging.info(f"Read PDF file: {filename}, length: {len(text)}")
+                else:
+                    logging.info(f"Skipping file: {filename} (unsupported format)")
+                    continue
+                embedding = model.encode(text).tolist()
+                logging.info(f"Generated embedding for {filename}, embedding length: {len(embedding)}")
+                collection.add(ids=[filename], embeddings=[embedding], documents=[text])
+                logging.info(f"Added {filename} to collection")
+        else:
+            logging.info("No files to index in data folder")
+        logging.info(f"Indexing completed in {time.time() - start_time:.2f} seconds")
+    except Exception as e:
+        logging.error(f"Indexing failed: {str(e)}", exc_info=True)
+
+# Index at startup
+logging.info("Indexing documents at startup...")
+index_documents()
+logging.info("Startup indexing complete")
+
+# Custom error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logging.error(f"Unhandled exception: {str(e)}", exc_info=True)
+    return render_template_string('''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Error</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; }
+                h1 { color: #d9534f; }
+                p { color: #333; }
+            </style>
+        </head>
+        <body>
+            <h1>Error</h1>
+            <p>An error occurred: {{ error }}</p>
+            <p>Check the logs at C:\\MyLLM\\app.log for details.</p>
+        </body>
+        </html>
+    ''', error=str(e)), 500
+
+@app.route('/', methods=['GET', 'POST'])
+def chat():
+    try:
+        response = ""
+        query_time = gen_time = 0
+        selected_chat = request.args.get('chat_id', None)
+        current_chat = None
+
+        # Load current chat if selected
+        if selected_chat:
+            for chat in chat_history:
+                if chat['id'] == selected_chat:
+                    current_chat = chat
+                    break
+
+        if request.method == 'POST':
+            start_time = time.time()
+            if 'file' in request.files:
+                file = request.files['file']
+                if file.filename:
+                    filepath = os.path.join(data_folder, file.filename)
+                    file.save(filepath)
+                    logging.info(f"Uploaded {file.filename}. Re-indexing...")
+                    index_documents()
+                    response = f"Uploaded {file.filename} successfully."
+            elif 'reindex' in request.form:
+                logging.info("Manual reindex triggered via UI...")
+                index_documents()
+                # Debug: Log current collection contents
+                collection_contents = collection.get()
+                logging.info(f"Collection after reindex: IDs={collection_contents['ids']}, Documents={collection_contents['documents']}")
+                response = "Data repository reindexed successfully."
+            elif 'query' in request.form:
+                query = request.form['query']
+                if not selected_chat:
+                    # Start a new chat
+                    chat_id = str(len(chat_history) + 1)
+                    current_chat = {'id': chat_id, 'title': query[:30], 'messages': [], 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                    chat_history.append(current_chat)
+                else:
+                    for chat in chat_history:
+                        if chat['id'] == selected_chat:
+                            current_chat = chat
+                            break
+
+                # Process query
+                try:
+                    query_start = time.time()
+                    results = collection.query(query_texts=[query], n_results=1)
+                    query_time = time.time() - query_start
+                    context = " ".join(doc for doc in results['documents'][0] if doc)[:1000] if results['documents'] else ""
+                    logging.info(f"Query results for '{query}': IDs={results['ids']}, Documents={results['documents']}")
+                except Exception as e:
+                    logging.error(f"Query embedding failed: {str(e)}")
+                    response = "Error: Unable to process query due to embedding failure. Check logs for details."
+                    query_time = time.time() - query_start
+                    context = ""
+
+                if context:
+                    prompt = f"Context: {context}\nQuery: {query}"
+                    try:
+                        gen_start = time.time()
+                        response = ollama.generate(model='llama3', prompt=prompt)['response']
+                        gen_time = time.time() - gen_start
+                    except Exception as e:
+                        logging.error(f"Ollama generation failed: {str(e)}")
+                        response = "Error: Unable to generate response. Check if Ollama is running and the model is loaded."
+                        gen_time = time.time() - gen_start
+
+                # Add to current chat
+                current_chat['messages'].append({'query': query, 'response': response})
+                save_history(chat_history)
+
+        elapsed_time = time.time() - start_time if 'start_time' in locals() else 0
+        return render_template_string('''
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Local LLM Chat (LLaMA3)</title>
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+                        margin: 0;
+                        display: flex;
+                        height: 100vh;
+                        background-color: #f5f5f5;
+                    }
+                    .sidebar {
+                        width: 260px;
+                        background-color: #202123;
+                        color: white;
+                        padding: 20px;
+                        overflow-y: auto;
+                        border-right: 1px solid #444;
+                    }
+                    .sidebar h2 {
+                        font-size: 1.2em;
+                        margin-top: 0;
+                        color: #d1d5db;
+                    }
+                    .sidebar ul {
+                        list-style: none;
+                        padding: 0;
+                    }
+                    .sidebar li {
+                        padding: 10px;
+                        margin: 5px 0;
+                        background-color: #343541;
+                        border-radius: 5px;
+                        cursor: pointer;
+                        font-size: 0.9em;
+                        white-space: nowrap;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                    }
+                    .sidebar li:hover {
+                        background-color: #444654;
+                    }
+                    .sidebar li.active {
+                        background-color: #565869;
+                    }
+                    .main {
+                        flex: 1;
+                        display: flex;
+                        flex-direction: column;
+                        background-color: #f5f5f5;
+                    }
+                    .chat-area {
+                        flex: 1;
+                        padding: 20px;
+                        overflow-y: auto;
+                        background-color: #fff;
+                        border-bottom: 1px solid #ddd;
+                    }
+                    .message {
+                        margin-bottom: 20px;
+                        line-height: 1.5;
+                    }
+                    .message.user {
+                        text-align: right;
+                    }
+                    .message.user p {
+                        background-color: #007bff;
+                        color: white;
+                        display: inline-block;
+                        padding: 10px 15px;
+                        border-radius: 15px;
+                        max-width: 70%;
+                    }
+                    .message.bot p {
+                        background-color: #e9ecef;
+                        display: inline-block;
+                        padding: 10px 15px;
+                        border-radius: 15px;
+                        max-width: 70%;
+                    }
+                    .input-area {
+                        padding: 20px;
+                        background-color: #fff;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                    }
+                    .input-area form {
+                        width: 100%;
+                        max-width: 800px;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                    }
+                    .input-area input[type="text"] {
+                        width: 100%;
+                        padding: 10px 15px;
+                        font-size: 1em;
+                        border: 1px solid #ddd;
+                        border-radius: 25px;
+                        outline: none;
+                        margin-bottom: 10px;
+                    }
+                    .input-area input[type="submit"] {
+                        background-color: #007bff;
+                        color: white;
+                        border: none;
+                        padding: 8px 20px;
+                        border-radius: 20px;
+                        cursor: pointer;
+                        font-size: 0.9em;
+                    }
+                    .input-area input[type="submit"]:hover {
+                        background-color: #0056b3;
+                    }
+                    .upload-form, .reindex-form {
+                        margin-bottom: 10px;
+                    }
+                    .upload-form input[type="file"] {
+                        font-size: 0.9em;
+                    }
+                    .upload-form input[type="submit"], .reindex-form input[type="submit"] {
+                        background-color: #28a745;
+                        color: white;
+                        border: none;
+                        padding: 5px 15px;
+                        border-radius: 20px;
+                        cursor: pointer;
+                        font-size: 0.9em;
+                    }
+                    .upload-form input[type="submit"]:hover, .reindex-form input[type="submit"]:hover {
+                        background-color: #218838;
+                    }
+                    .timing {
+                        font-size: 0.8em;
+                        color: #666;
+                        text-align: center;
+                        margin-top: 10px;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="sidebar">
+                    <h2>Past Chats</h2>
+                    <ul>
+                        {% for chat in chat_history %}
+                            <li class="{% if chat.id == selected_chat %}active{% endif %}" onclick="window.location.href='/?chat_id={{ chat.id }}'">
+                                {{ chat.title }}<br>
+                                <small>{{ chat.timestamp }}</small>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                <div class="main">
+                    <div class="chat-area">
+                        {% if not current_chat %}
+                            <h2 style="text-align: center; color: #333;">What can I help with?</h2>
+                        {% else %}
+                            {% for msg in current_chat.messages %}
+                                <div class="message user">
+                                    <p>{{ msg.query }}</p>
+                                </div>
+                                <div class="message bot">
+                                    <p>{{ msg.response }}</p>
+                                </div>
+                            {% endfor %}
+                        {% endif %}
+                        {% if response and not current_chat %}
+                            <div class="message bot">
+                                <p>{{ response }}</p>
+                            </div>
+                        {% endif %}
+                    </div>
+                    <div class="input-area">
+                        <form method="post" enctype="multipart/form-data" class="upload-form">
+                            <input type="file" name="file">
+                            <input type="submit" value="Upload">
+                        </form>
+                        <form method="post" class="reindex-form">
+                            <input type="submit" name="reindex" value="Reindex Data">
+                        </form>
+                        <form method="post">
+                            <input type="text" name="query" placeholder="Ask anything" required>
+                            <input type="submit" value="Send">
+                        </form>
+                        {% if elapsed_time > 0.0 %}
+                            <div class="timing">
+                                Total time: {{ elapsed_time | float | round(2) }} seconds (Query: {{ query_time | float | round(2) }}s, Generate: {{ gen_time | float | round(2) }}s)
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </body>
+            </html>
+        ''', chat_history=chat_history, current_chat=current_chat, selected_chat=selected_chat,
+           response=response, elapsed_time=elapsed_time, query_time=query_time, gen_time=gen_time)
+    except Exception as e:
+        logging.error(f"Error in chat route: {str(e)}", exc_info=True)
+        raise
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000)
+"@
+
+Set-Content -Path "C:\MyLLM\app.py" -Value $appPyLlama3
+Write-Host "Created app.py for C:\MyLLM (llama3, port 5000)"
+
+# Step 7: Create app.py for C:\MyLLM-2.0 (phi3, port 5001)
+$appPyPhi3 = @"
+from flask import Flask, request, render_template_string
+import ollama
+import chromadb
+from sentence_transformers import SentenceTransformer
+import os
+import PyPDF2
+import time
+import warnings
+import json
+from datetime import datetime
+import logging
+
+# Set up logging
+logging.basicConfig(filename=r"C:\MyLLM-2.0\app.log", level=logging.DEBUG, 
+                    format='%(asctime)s %(levelname)s: %(message)s')
+
+# Suppress FutureWarning from transformers
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+app = Flask(__name__)
+client = chromadb.PersistentClient(path=r"C:\MyLLM-2.0\chroma_db")
+collection = client.get_or_create_collection("rag_collection")
+model = None
+data_folder = r"C:\MyLLM-2.0\data"
+history_file = r"C:\MyLLM-2.0\chat_history.json"
+
+# Ensure data folder exists
+if not os.path.exists(data_folder):
+    os.makedirs(data_folder)
+
+# Check if phi3 model is available
+try:
+    ollama_response = ollama.list()
+    logging.info(f"Raw Ollama list response: {ollama_response}")
+    if 'models' not in ollama_response:
+        raise ValueError("Ollama list response does not contain 'models' key. Ensure Ollama server is running.")
+    models = ollama_response['models']
+    model_names = [m.get('name', '') for m in models]
+    if not model_names:
+        raise ValueError("No models found in Ollama. Run 'ollama pull phi3' to download the model.")
+    if 'phi3:latest' not in model_names:
+        raise ValueError("Model 'phi3' not found. Run 'ollama pull phi3' to download it.")
+    logging.info("Model 'phi3' found in Ollama")
+except Exception as e:
+    logging.error(f"Failed to verify Ollama models: {str(e)}")
+    raise
+
+# Load or initialize chat history
+def load_history():
+    try:
+        if os.path.exists(history_file):
+            with open(history_file, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load chat history: {str(e)}")
+    return []
+
+def save_history(history):
+    try:
+        with open(history_file, 'w') as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logging.error(f"Failed to save chat history: {str(e)}")
+
+# Initialize history
+chat_history = load_history()
+
+# Initialize SentenceTransformer
+try:
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    logging.info("SentenceTransformer loaded successfully")
+except Exception as e:
+    logging.error(f"Failed to load SentenceTransformer: {str(e)}")
+    raise
+
+def index_documents():
+    try:
+        start_time = time.time()
+        existing_ids = collection.get()['ids']
+        logging.info(f"Existing IDs in collection: {existing_ids}")
+        if existing_ids:
+            collection.delete(ids=existing_ids)
+            logging.info("Deleted existing IDs from collection")
+        files = os.listdir(data_folder)
+        logging.info(f"Files in data folder: {files}")
+        if files:
+            for filename in files:
+                filepath = os.path.join(data_folder, filename)
+                logging.info(f"Processing file: {filename}")
+                if filename.endswith('.txt'):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                    logging.info(f"Read text file: {filename}, length: {len(text)}")
+                elif filename.endswith('.pdf'):
+                    with open(filepath, 'rb') as f:
+                        pdf = PyPDF2.PdfReader(f)
+                        text = " ".join(page.extract_text() for page in pdf.pages)
+                    logging.info(f"Read PDF file: {filename}, length: {len(text)}")
+                else:
+                    logging.info(f"Skipping file: {filename} (unsupported format)")
+                    continue
+                embedding = model.encode(text).tolist()
+                logging.info(f"Generated embedding for {filename}, embedding length: {len(embedding)}")
+                collection.add(ids=[filename], embeddings=[embedding], documents=[text])
+                logging.info(f"Added {filename} to collection")
+        else:
+            logging.info("No files to index in data folder")
+        logging.info(f"Indexing completed in {time.time() - start_time:.2f} seconds")
+    except Exception as e:
+        logging.error(f"Indexing failed: {str(e)}", exc_info=True)
+
+# Index at startup
+logging.info("Indexing documents at startup...")
+index_documents()
+logging.info("Startup indexing complete")
+
+# Custom error handler
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logging.error(f"Unhandled exception: {str(e)}", exc_info=True)
+    return render_template_string('''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Error</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 40px; }
+                h1 { color: #d9534f; }
+                p { color: #333; }
+            </style>
+        </head>
+        <body>
+            <h1>Error</h1>
+            <p>An error occurred: {{ error }}</p>
+            <p>Check the logs at C:\\MyLLM-2.0\\app.log for details.</p>
+        </body>
+        </html>
+    ''', error=str(e)), 500
+
+@app.route('/', methods=['GET', 'POST'])
+def chat():
+    try:
+        response = ""
+        query_time = gen_time = 0
+        selected_chat = request.args.get('chat_id', None)
+        current_chat = None
+
+        # Load current chat if selected
+        if selected_chat:
+            for chat in chat_history:
+                if chat['id'] == selected_chat:
+                    current_chat = chat
+                    break
+
+        if request.method == 'POST':
+            start_time = time.time()
+            if 'file' in request.files:
+                file = request.files['file']
+                if file.filename:
+                    filepath = os.path.join(data_folder, file.filename)
+                    file.save(filepath)
+                    logging.info(f"Uploaded {file.filename}. Re-indexing...")
+                    index_documents()
+                    response = f"Uploaded {file.filename} successfully."
+            elif 'reindex' in request.form:
+                logging.info("Manual reindex triggered via UI...")
+                index_documents()
+                # Debug: Log current collection contents
+                collection_contents = collection.get()
+                logging.info(f"Collection after reindex: IDs={collection_contents['ids']}, Documents={collection_contents['documents']}")
+                response = "Data repository reindexed successfully."
+            elif 'query' in request.form:
+                query = request.form['query']
+                if not selected_chat:
+                    # Start a new chat
+                    chat_id = str(len(chat_history) + 1)
+                    current_chat = {'id': chat_id, 'title': query[:30], 'messages': [], 'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+                    chat_history.append(current_chat)
+                else:
+                    for chat in chat_history:
+                        if chat['id'] == selected_chat:
+                            current_chat = chat
+                            break
+
+                # Process query
+                try:
+                    query_start = time.time()
+                    results = collection.query(query_texts=[query], n_results=1)
+                    query_time = time.time() - query_start
+                    context = " ".join(doc for doc in results['documents'][0] if doc)[:1000] if results['documents'] else ""
+                    logging.info(f"Query results for '{query}': IDs={results['ids']}, Documents={results['documents']}")
+                except Exception as e:
+                    logging.error(f"Query embedding failed: {str(e)}")
+                    response = "Error: Unable to process query due to embedding failure. Check logs for details."
+                    query_time = time.time() - query_start
+                    context = ""
+
+                if context:
+                    prompt = f"Context: {context}\nQuery: {query}"
+                    try:
+                        gen_start = time.time()
+                        response = ollama.generate(model='phi3', prompt=prompt)['response']
+                        gen_time = time.time() - gen_start
+                    except Exception as e:
+                        logging.error(f"Ollama generation failed: {str(e)}")
+                        response = "Error: Unable to generate response. Check if Ollama is running and the model is loaded."
+                        gen_time = time.time() - gen_start
+
+                # Add to current chat
+                current_chat['messages'].append({'query': query, 'response': response})
+                save_history(chat_history)
+
+        elapsed_time = time.time() - start_time if 'start_time' in locals() else 0
+        return render_template_string('''
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>Local LLM Chat (Phi3)</title>
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+                        margin: 0;
+                        display: flex;
+                        height: 100vh;
+                        background-color: #f5f5f5;
+                    }
+                    .sidebar {
+                        width: 260px;
+                        background-color: #202123;
+                        color: white;
+                        padding: 20px;
+                        overflow-y: auto;
+                        border-right: 1px solid #444;
+                    }
+                    .sidebar h2 {
+                        font-size: 1.2em;
+                        margin-top: 0;
+                        color: #d1d5db;
+                    }
+                    .sidebar ul {
+                        list-style: none;
+                        padding: 0;
+                    }
+                    .sidebar li {
+                        padding: 10px;
+                        margin: 5px 0;
+                        background-color: #343541;
+                        border-radius: 5px;
+                        cursor: pointer;
+                        font-size: 0.9em;
+                        white-space: nowrap;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                    }
+                    .sidebar li:hover {
+                        background-color: #444654;
+                    }
+                    .sidebar li.active {
+                        background-color: #565869;
+                    }
+                    .main {
+                        flex: 1;
+                        display: flex;
+                        flex-direction: column;
+                        background-color: #f5f5f5;
+                    }
+                    .chat-area {
+                        flex: 1;
+                        padding: 20px;
+                        overflow-y: auto;
+                        background-color: #fff;
+                        border-bottom: 1px solid #ddd;
+                    }
+                    .message {
+                        margin-bottom: 20px;
+                        line-height: 1.5;
+                    }
+                    .message.user {
+                        text-align: right;
+                    }
+                    .message.user p {
+                        background-color: #007bff;
+                        color: white;
+                        display: inline-block;
+                        padding: 10px 15px;
+                        border-radius: 15px;
+                        max-width: 70%;
+                    }
+                    .message.bot p {
+                        background-color: #e9ecef;
+                        display: inline-block;
+                        padding: 10px 15px;
+                        border-radius: 15px;
+                        max-width: 70%;
+                    }
+                    .input-area {
+                        padding: 20px;
+                        background-color: #fff;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                    }
+                    .input-area form {
+                        width: 100%;
+                        max-width: 800px;
+                        display: flex;
+                        flex-direction: column;
+                        align-items: center;
+                    }
+                    .input-area input[type="text"] {
+                        width: 100%;
+                        padding: 10px 15px;
+                        font-size: 1em;
+                        border: 1px solid #ddd;
+                        border-radius: 25px;
+                        outline: none;
+                        margin-bottom: 10px;
+                    }
+                    .input-area input[type="submit"] {
+                        background-color: #007bff;
+                        color: white;
+                        border: none;
+                        padding: 8px 20px;
+                        border-radius: 20px;
+                        cursor: pointer;
+                        font-size: 0.9em;
+                    }
+                    .input-area input[type="submit"]:hover {
+                        background-color: #0056b3;
+                    }
+                    .upload-form, .reindex-form {
+                        margin-bottom: 10px;
+                    }
+                    .upload-form input[type="file"] {
+                        font-size: 0.9em;
+                    }
+                    .upload-form input[type="submit"], .reindex-form input[type="submit"] {
+                        background-color: #28a745;
+                        color: white;
+                        border: none;
+                        padding: 5px 15px;
+                        border-radius: 20px;
+                        cursor: pointer;
+                        font-size: 0.9em;
+                    }
+                    .upload-form input[type="submit"]:hover, .reindex-form input[type="submit"]:hover {
+                        background-color: #218838;
+                    }
+                    .timing {
+                        font-size: 0.8em;
+                        color: #666;
+                        text-align: center;
+                        margin-top: 10px;
+                    }
+                </style>
+            </head>
+            <body>
+                <div class="sidebar">
+                    <h2>Past Chats</h2>
+                    <ul>
+                        {% for chat in chat_history %}
+                            <li class="{% if chat.id == selected_chat %}active{% endif %}" onclick="window.location.href='/?chat_id={{ chat.id }}'">
+                                {{ chat.title }}<br>
+                                <small>{{ chat.timestamp }}</small>
+                            </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                <div class="main">
+                    <div class="chat-area">
+                        {% if not current_chat %}
+                            <h2 style="text-align: center; color: #333;">What can I help with?</h2>
+                        {% else %}
+                            {% for msg in current_chat.messages %}
+                                <div class="message user">
+                                    <p>{{ msg.query }}</p>
+                                </div>
+                                <div class="message bot">
+                                    <p>{{ msg.response }}</p>
+                                </div>
+                            {% endfor %}
+                        {% endif %}
+                        {% if response and not current_chat %}
+                            <div class="message bot">
+                                <p>{{ response }}</p>
+                            </div>
+                        {% endif %}
+                    </div>
+                    <div class="input-area">
+                        <form method="post" enctype="multipart/form-data" class="upload-form">
+                            <input type="file" name="file">
+                            <input type="submit" value="Upload">
+                        </form>
+                        <form method="post" class="reindex-form">
+                            <input type="submit" name="reindex" value="Reindex Data">
+                        </form>
+                        <form method="post">
+                            <input type="text" name="query" placeholder="Ask anything" required>
+                            <input type="submit" value="Send">
+                        </form>
+                        {% if elapsed_time > 0.0 %}
+                            <div class="timing">
+                                Total time: {{ elapsed_time | float | round(2) }} seconds (Query: {{ query_time | float | round(2) }}s, Generate: {{ gen_time | float | round(2) }}s)
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </body>
+            </html>
+        ''', chat_history=chat_history, current_chat=current_chat, selected_chat=selected_chat,
+           response=response, elapsed_time=elapsed_time, query_time=query_time, gen_time=gen_time)
+    except Exception as e:
+        logging.error(f"Error in chat route: {str(e)}", exc_info=True)
+        raise
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5001)
+"@
+
+Set-Content -Path "C:\MyLLM-2.0\app.py" -Value $appPyPhi3
+Write-Host "Created app.py for C:\MyLLM-2.0 (phi3, port 5001)"
+
+# Step 8: Start Ollama Server (if not already running)
+$ollamaPort = 11434
+$portInUse = Test-NetConnection -ComputerName 127.0.0.1 -Port $ollamaPort -InformationLevel Quiet
+if (-not $portInUse) {
+    Write-Host "Starting Ollama server..."
+    Start-Process -FilePath "ollama" -ArgumentList "serve" -NoNewWindow
+    Start-Sleep -Seconds 5  # Wait for Ollama to start
+} else {
+    Write-Host "Ollama server already running on port $ollamaPort."
+}
+
+# Step 9: Start Flask Servers
+Write-Host "Starting Flask server for llama3 (port 5000)..."
+Start-Process python -ArgumentList "C:\MyLLM\app.py" -NoNewWindow -RedirectStandardOutput "C:\MyLLM\app.log"
+
+Write-Host "Starting Flask server for phi3 (port 5001)..."
+Start-Process python -ArgumentList "C:\MyLLM-2.0\app.py" -NoNewWindow -RedirectStandardOutput "C:\MyLLM-2.0\app.log"
+
+Write-Host "Setup complete! Access the applications at:"
+Write-Host " - LLaMA3: http://localhost:5000"
+Write-Host " - Phi3: http://localhost:5001"
